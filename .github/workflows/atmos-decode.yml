@@ -91,13 +91,13 @@ jobs:
       - name: Smoke test
         run: |
           set -euo pipefail
-          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
           bin=linux-atmos/thd-atmos/target/release/thd-atmos
           "$bin" --positions
-          ffmpeg -v error -f lavfi -i "sine=f=440:d=2" -ac 6 -ar 48000 -strict -2 -c:a truehd -f truehd test.thd
-          bytes=$("$bin" < test.thd | wc -c)
+          # 2 s of 5.1 TrueHD encoded with FFmpeg 6.1 (a stream encoded on this runner with FFmpeg 4.4
+          # gave no output) -> 2 s x 48 kHz x 12 channels x 4 bytes
+          bytes=$("$bin" < linux-atmos/thd-atmos/tests/sine-5.1.thd | wc -c)
           echo "thd-atmos: $bytes bytes"
-          test "$bytes" -gt 1000000
+          test "$bytes" -eq 4608000
           mkdir -p dist && cp "$bin" dist/thd-atmos-linux-x64
 
       - uses: actions/upload-artifact@v4
