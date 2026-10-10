@@ -22,9 +22,9 @@ jobs:
     # Oldest supported runner: the binaries need glibc >= 2.35
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 8.0.x
 
@@ -38,13 +38,14 @@ jobs:
           DOTNET_CLI_TELEMETRY_OPTOUT: 1
         run: |
           mkdir -p "$GITHUB_WORKSPACE/dist"
-          # x86-64-v3 (AVX2, Haswell/Zen and newer) is ~20% faster; the baseline build is the fallback
-          for isa in x86-x64-v3 x86-x64-v1; do
-            rm -rf bin obj
-            dotnet publish -c Release -r linux-x64 -p:PublishAot=true -p:IlcInstructionSet=$isa -o "out-$isa"
-          done
-          cp out-x86-x64-v3/atmos-decode "$GITHUB_WORKSPACE/dist/atmos-decode-linux-x64-v3"
-          cp out-x86-x64-v1/atmos-decode "$GITHUB_WORKSPACE/dist/atmos-decode-linux-x64"
+          aot="-c Release -r linux-x64 -p:PublishAot=true"
+          # x86-64-v3 (AVX2, Haswell/Zen and newer) is ~20% faster
+          dotnet publish $aot -p:IlcInstructionSet=x86-x64-v3 -o out-v3
+          # Baseline x86-64 fallback (the default instruction set)
+          rm -rf bin obj
+          dotnet publish $aot -o out-baseline
+          cp out-v3/atmos-decode "$GITHUB_WORKSPACE/dist/atmos-decode-linux-x64-v3"
+          cp out-baseline/atmos-decode "$GITHUB_WORKSPACE/dist/atmos-decode-linux-x64"
 
       - name: Smoke test
         run: |
