@@ -77,13 +77,40 @@ jobs:
 
   thd-atmos:
     runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v5
 
+      # Compiling thd-atmos takes ~5 minutes, so the released binary is reused while its source
+      # (and this job's build settings, the "v1" below) stay the same.
+      - name: Reuse the released build if the source is unchanged
+        id: reuse
+        run: |
+          set -euo pipefail
+          cd linux-atmos/thd-atmos
+          hash=$( { echo v1; cat Cargo.toml Cargo.lock; find src -type f | sort | xargs cat; } | sha256sum | cut -d' ' -f1)
+          echo "$hash" > "$GITHUB_WORKSPACE/thd-atmos.source"
+          mkdir -p "$GITHUB_WORKSPACE/prev"
+          if gh release download atmos-decode-latest -p thd-atmos-linux-x64 -p thd-atmos.source \
+                -D "$GITHUB_WORKSPACE/prev" 2>/dev/null &&
+             [[ $(cat "$GITHUB_WORKSPACE/prev/thd-atmos.source") == "$hash" ]]; then
+            echo "Source unchanged since the released build ($hash): reusing it"
+            echo "bin=$GITHUB_WORKSPACE/prev/thd-atmos-linux-x64" >> "$GITHUB_OUTPUT"
+            chmod +x "$GITHUB_WORKSPACE/prev/thd-atmos-linux-x64"
+          else
+            echo "Source changed (or no released build): compiling"
+            echo "bin=$GITHUB_WORKSPACE/linux-atmos/thd-atmos/target/release/thd-atmos" >> "$GITHUB_OUTPUT"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install Rust
+        if: steps.reuse.outputs.build == 'true'
         run: rustup toolchain install stable --profile minimal && rustup default stable
 
       - name: Build
+        if: steps.reuse.outputs.build == 'true'
         working-directory: linux-atmos/thd-atmos
         # One job: compiling the truehd crate optimised peaks at ~11 GB of RAM (runners have 16)
         run: cargo build --release --locked -j 1
@@ -91,14 +118,14 @@ jobs:
       - name: Smoke test
         run: |
           set -euo pipefail
-          bin=linux-atmos/thd-atmos/target/release/thd-atmos
+          bin="${{ steps.reuse.outputs.bin }}"
           "$bin" --positions
           # 2 s of 5.1 TrueHD encoded with FFmpeg 6.1 (a stream encoded on this runner with FFmpeg 4.4
           # gave no output) -> 2 s x 48 kHz x 12 channels x 4 bytes
           bytes=$("$bin" < linux-atmos/thd-atmos/tests/sine-5.1.thd | wc -c)
           echo "thd-atmos: $bytes bytes"
           test "$bytes" -eq 4608000
-          mkdir -p dist && cp "$bin" dist/thd-atmos-linux-x64
+          mkdir -p dist && cp "$bin" dist/thd-atmos-linux-x64 && cp thd-atmos.source dist/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -134,4 +161,4 @@ jobs:
           else
             gh release create "$tag" --prerelease --target "$GITHUB_SHA" --title "atmos-decode (latest build)" --notes "$notes"
           fi
-          gh release upload "$tag" atmos-decode-* thd-atmos-* SHA256SUMS --clobber
+          gh release upload "$tag" atmos-decode-* thd-atmos-* thd-atmos.source SHA256SUMS --clobber
