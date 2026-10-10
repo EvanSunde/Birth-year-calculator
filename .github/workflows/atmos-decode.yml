@@ -65,7 +65,8 @@ jobs:
             test "$bytes" -gt 1000000
             "./$bin" --mka 1.5 - < test.eac3 > test.mka
             ffprobe -v error -show_entries stream=channel_layout:format=start_time -of compact test.mka | tee probe.txt
-            grep -q "channel_layout=7.1.4" probe.txt
+            # FFmpeg < 5.1 has no name for 7.1.4 and lists the channels instead
+            grep -Eq "channel_layout=(7\.1\.4|.*FL\+FR\+FC\+LFE\+BL\+BR\+SL\+SR\+TFL\+TFR\+TBL\+TBR)" probe.txt
           done
           rm test.eac3 test.mka probe.txt
 

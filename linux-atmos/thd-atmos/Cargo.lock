@@ -71,7 +71,6 @@ dependencies = [
 name = "thd-atmos"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "truehd",
 ]
 
