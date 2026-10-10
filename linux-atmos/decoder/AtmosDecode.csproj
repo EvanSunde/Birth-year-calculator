@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>atmos-decode</AssemblyName>
+    <RootNamespace>AtmosDecode</RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Run on whatever newer .NET runtime the distro ships (Arch: dotnet-runtime) -->
+    <RollForward>Major</RollForward>
+    <ServerGarbageCollector>false</ServerGarbageCollector>
+    <Description>Decodes Dolby Atmos (E-AC-3 + JOC, Dolby Atmos Master Format) with Cavern and streams speaker-rendered PCM to stdout.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Cavern by VoidX: https://github.com/VoidXH/Cavern (free for non-commercial use, see its LICENSE.md) -->
+    <PackageReference Include="Cavern.Format" Version="2.1.0" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# atmos-play: play Dolby Atmos music on Linux through PipeWire.
+#
+#   headphones (default): E-AC-3 Atmos / .atmos -> atmos-decode (Cavern, objects -> 7.1.4)
+#                         -> "Atmos Headphones" PipeWire sink (HRTF -> binaural)
+#                         TrueHD is decoded by FFmpeg (7.1 bed, no height objects yet)
+#   --passthrough:        send the untouched E-AC-3 / TrueHD bitstream over HDMI/S/PDIF
+#                         to an Atmos AV receiver, which decodes it (via mpv)
+#
+# Files without Atmos (AAC, FLAC, AC-3, ...) are decoded by FFmpeg and played through the
+# same sink, so the whole library can go through one output.
+set -euo pipefail
+
+SINK="${ATMOS_SINK:-effect_input.atmos_headphones}"
+LAYOUT="${ATMOS_LAYOUT:-7.1.4}"
+DECODER="${ATMOS_DECODER:-atmos-decode}"
+GAIN_DB="${ATMOS_GAIN_DB:-0}"
+MODE=headphones
+
+usage() {
+    cat <<EOF
+Usage: atmos-play [options] <file>...
+
+Plays Dolby Atmos (E-AC-3 + JOC, TrueHD) and any other audio through PipeWire.
+
+Options:
+  -s, --sink <node>     PipeWire sink to play into (default: $SINK)
+  -l, --layout <name>   Speaker layout rendered by atmos-decode (default: $LAYOUT)
+  -g, --gain <dB>       Gain applied by atmos-decode (default: $GAIN_DB)
+  -p, --passthrough     Bitstream E-AC-3/TrueHD to an Atmos receiver over HDMI (uses mpv)
+      --ffmpeg          Skip atmos-decode and let FFmpeg decode (7.1 bed, no height objects)
+  -n, --dry-run         Print the pipeline instead of running it
+  -h, --help            Show this help
+
+Environment: ATMOS_SINK, ATMOS_LAYOUT, ATMOS_DECODER, ATMOS_GAIN_DB
+EOF
+}
+
+die() { echo "atmos-play: $*" >&2; exit 1; }
+note() { echo "atmos-play: $*" >&2; }
+need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found. $2"; }
+
+DRY_RUN=0
+FILES=()
+while (($#)); do
+    case "$1" in
+        -s|--sink) SINK="${2:?}"; shift ;;
+        -l|--layout) LAYOUT="${2:?}"; shift ;;
+        -g|--gain) GAIN_DB="${2:?}"; shift ;;
+        -p|--passthrough) MODE=passthrough ;;
+        --ffmpeg) MODE=ffmpeg ;;
+        -n|--dry-run) DRY_RUN=1 ;;
+        -h|--help) usage; exit 0 ;;
+        --) shift; FILES+=("$@"); break ;;
+        -*) die "unknown option: $1 (see --help)" ;;
+        *) FILES+=("$1") ;;
+    esac
+    shift
+done
+((${#FILES[@]})) || { usage >&2; exit 2; }
+
+need ffprobe "Install ffmpeg (pacman -S ffmpeg)."
+
+# Newer pw-cat needs --raw to read headerless PCM from stdin; PipeWire <= 1.0 has no such
+# option and treats "-" as raw already.
+PW_RAW=()
+if [[ $MODE != passthrough ]]; then
+    need pw-play "Install pipewire (pacman -S pipewire)."
+    if pw-play --help 2>&1 | grep -q -- '--raw'; then
+        PW_RAW=(--raw)
+    fi
+fi
+
+run() {
+    if ((DRY_RUN)); then
+        printf '%s\n' "$*"
+    else
+        bash -o pipefail -c "$*"
+    fi
+}
+
+q() { printf '%q' "$1"; }
+
+probe() { # <file> <stream field> - first audio stream's value of one field
+    ffprobe -v error -select_streams a:0 -show_entries "stream=$2" -of default=nw=1:nk=1 "$1" | head -n 1
+}
+
+# pw-play reading interleaved float32 from stdin into the sink.
+pw_sink_cmd() { # <channels> <channel-map> <rate>
+    echo "pw-play ${PW_RAW[*]} --target $(q "$SINK") --format f32 --rate $3 --channels $1 --channel-map $2 -"
+}
+
+play_passthrough() {
+    need mpv "Install mpv (pacman -S mpv) for HDMI passthrough."
+    # mpv wraps the bitstream in IEC 61937 itself. The PipeWire HDMI sink must allow the
+    # formats; see docs/home-theater.md.
+    run "mpv --no-video --audio-spdif=eac3,truehd,ac3,dts-hd,dts $(q "$1")"
+}
+
+play_ffmpeg() { # <file> - decode with FFmpeg (core/bed only for Atmos streams)
+    local file="$1" channels
+    channels=$(probe "$file" channels)
+    if ((channels > 2)); then
+        # FFmpeg's 7.1 order FL FR FC LFE BL BR SL SR == PipeWire FL FR FC LFE RL RR SL SR
+        run "ffmpeg -nostdin -v error -i $(q "$file") -map 0:a:0 -af aformat=channel_layouts=7.1 -ar 48000 -f f32le - | $(pw_sink_cmd 8 FL,FR,FC,LFE,RL,RR,SL,SR 48000)"
+    else
+        run "ffmpeg -nostdin -v error -i $(q "$file") -map 0:a:0 -ac 2 -ar 48000 -f f32le - | $(pw_sink_cmd 2 FL,FR 48000)"
+    fi
+}
+
+play_atmos() { # <file> <codec>
+    local file="$1" codec="$2" map rate src
+    if ! command -v "$DECODER" >/dev/null 2>&1; then
+        note "atmos-decode not installed - falling back to FFmpeg (no height channels)."
+        play_ffmpeg "$file"
+        return
+    fi
+    map=$("$DECODER" --layout "$LAYOUT" --positions)
+    rate=$(probe "$file" sample_rate)
+    if [[ $codec == eac3 ]]; then
+        # Let FFmpeg demux whatever container this is (M4A/MP4/MKV/TS...) into a raw E-AC-3
+        # stream; Cavern's own MP4 reader doesn't recognise every muxer's E-AC-3 tracks.
+        src="ffmpeg -nostdin -v error -i $(q "$file") -map 0:a:0 -c copy -f eac3 - | $(q "$DECODER") --layout $(q "$LAYOUT") --gain $(q "$GAIN_DB") -"
+    else
+        # Dolby Atmos Master Format (.atmos, e.g. from truehdd): Cavern reads it directly.
+        src="$(q "$DECODER") --layout $(q "$LAYOUT") --gain $(q "$GAIN_DB") $(q "$file")"
+    fi
+    run "$src | $(pw_sink_cmd "$(tr ',' '\n' <<<"$map" | wc -l)" "$map" "$rate")"
+}
+
+for file in "${FILES[@]}"; do
+    [[ -r $file ]] || die "cannot read: $file"
+    codec=$(probe "$file" codec_name || true)
+    profile=$(probe "$file" profile || true)
+    [[ $profile == unknown ]] && profile=
+    note "$(basename -- "$file"): ${codec:-unknown}${profile:+ ($profile)}"
+
+    if [[ $MODE == passthrough ]]; then
+        play_passthrough "$file"
+    elif [[ $MODE == headphones && ( $codec == eac3 || $file == *.atmos ) ]]; then
+        play_atmos "$file" "$codec"
+    else
+        if [[ $codec == truehd ]]; then
+            # Cavern parses TrueHD but can't decode its audio yet. See docs/README for truehdd.
+            note "TrueHD: playing the 7.1 bed via FFmpeg (use --passthrough for full Atmos on a receiver)."
+        fi
+        play_ffmpeg "$file"
+    fi
+done
