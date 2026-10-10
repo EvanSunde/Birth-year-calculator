@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# atmos-stream <file> <stream-index> <start-seconds> [timeline-shift]
+# Real-time Atmos decode from <start-seconds>: writes a live Matroska stream (12-ch float, 7.1.4)
+# to stdout whose timestamps match the film, so mpv can play it as the audio track
+# (mpv/scripts/atmos-live.lua runs this on every seek).
+#   E-AC-3 + JOC -> atmos-decode (Cavern)      TrueHD Atmos -> thd-atmos, wrapped by atmos-decode
+# The decoder writes the Matroska stream itself (float PCM + channel mask), so there is no
+# re-encode between it and mpv.
+set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"   # also when mpv was started from the desktop
+in="$1" idx="$2" t="$3" shift="${4:-0}"   # output timestamps = file timestamps - shift
+
+probe() { ffprobe -v error -select_streams "$idx" -show_entries "stream=$1" -of default=nw=1:nk=1 "$in" | head -n1; }
+codec=$(probe codec_name)
+rate=$(probe sample_rate)
+case $codec in
+    eac3|truehd) ;;
+    *) echo "atmos-stream: unsupported codec $codec" >&2; exit 1 ;;
+esac
+
+# Timestamp of the first decodable packet (keyframe = E-AC-3 frame / TrueHD major sync) at or
+# after $t: the decoded audio starts exactly there.
+pre=$(awk -v t="$t" 'BEGIN { s = t - 0.5; print (s < 0 ? 0 : s) }')
+first=$(ffprobe -v error -read_intervals "${pre}%+1.5" -select_streams "$idx" \
+        -show_entries packet=pts_time,flags -of csv=p=0:nk=1 "$in" | cut -d, -f1,2 |
+        awk -F, -v t="$t" '$1 != "N/A" && $2 ~ /^K/ && $1 + 0 >= t - 0.0001 { print $1; exit }')
+[[ -n $first ]] || first="$t"
+start=$(awk -v f="$first" -v s="$shift" 'BEGIN { printf "%.6f", f - s }')
+
+# Packets before $first are dropped by timestamp (FFmpeg's own -ss cut may keep an earlier frame).
+ffmpeg -nostdin -v fatal -copyts -ss "$pre" -i "$in" -map "0:$idx" -c copy \
+       -bsf:a "noise=drop=lt(pts*tb\\,$first-0.0002)" -f "$codec" - |
+    if [[ $codec == eac3 ]]; then
+        atmos-decode --layout 7.1.4 --mka "$start" -
+    else
+        thd-atmos | atmos-decode --layout 7.1.4 --mka "$start" --wrap-pcm "$rate"
+    fi

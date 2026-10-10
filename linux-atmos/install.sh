@@ -4,6 +4,9 @@
 #   ~/.local/bin/atmos-play     player script
 #   ~/.local/share/linux-atmos/ HRTF (SOFA) file + decoder binary
 #   ~/.config/pipewire/pipewire.conf.d/atmos-headphones.conf   the binaural sink
+# With --mpv, also real-time Atmos in mpv (mpv/scripts/atmos-live.lua):
+#   ~/.local/bin/atmos-stream, ~/.local/bin/thd-atmos (TrueHD), ~/.config/mpv/scripts/atmos-live.lua
+#   and a block in ~/.config/mpv/mpv.conf that sends mpv to the Atmos Headphones sink
 #
 # Arch Linux dependencies:  sudo pacman -S --needed pipewire ffmpeg
 # Optional (HDMI passthrough to an AV receiver): sudo pacman -S mpv
@@ -27,6 +30,8 @@ LFE_GAIN="0.5"
 RESTART=1
 SKIP_DECODER=0
 FROM_SOURCE=0
+MPV=0
+MPV_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/mpv"
 
 # Native atmos-decode builds published by .github/workflows/atmos-decode.yml
 RELEASE_URL="${ATMOS_RELEASE_URL:-https://github.com/EvanSunde/Birth-year-calculator/releases/download/atmos-decode-latest}"
@@ -39,7 +44,8 @@ Usage: ./install.sh [options]
   --radius <m>         Measurement distance of the SOFA file (default $HRTF_RADIUS)
   --hrtf-gain <x>      Gain of each virtual speaker (default $HRTF_GAIN)
   --lfe-gain <x>       Gain of the LFE channel into both ears (default $LFE_GAIN)
-  --build-from-source  Build atmos-decode with dotnet-sdk instead of downloading the prebuilt binary
+  --mpv                Also install real-time Atmos decoding for mpv (heights in films and music)
+  --build-from-source  Build the decoders (dotnet-sdk; cargo for --mpv) instead of downloading them
   --skip-decoder       Don't install atmos-decode (FFmpeg-only playback: no height channels)
   --no-restart         Don't restart PipeWire after installing the sink
   --uninstall          Remove everything this script installed
@@ -50,7 +56,9 @@ die() { echo "install: $*" >&2; exit 1; }
 note() { echo "==> $*"; }
 
 uninstall() {
-    rm -f "$BIN_DIR/atmos-play" "$BIN_DIR/atmos-decode" "$PW_CONF"
+    rm -f "$BIN_DIR/atmos-play" "$BIN_DIR/atmos-decode" "$BIN_DIR/atmos-stream" "$BIN_DIR/thd-atmos" "$PW_CONF" \
+        "$MPV_DIR/scripts/atmos-live.lua"
+    [[ -f $MPV_DIR/mpv.conf ]] && sed -i '/# >>> linux-atmos >>>/,/# <<< linux-atmos <<</d' "$MPV_DIR/mpv.conf"
     rm -rf "$DATA_DIR"
     note "Removed linux-atmos. Restart PipeWire to drop the sink: systemctl --user restart pipewire"
 }
@@ -63,6 +71,7 @@ while (($#)); do
         --lfe-gain) LFE_GAIN="${2:?}"; shift ;;
         --skip-decoder) SKIP_DECODER=1 ;;
         --build-from-source) FROM_SOURCE=1 ;;
+        --mpv) MPV=1 ;;
         --no-restart) RESTART=0 ;;
         --uninstall) uninstall; exit 0 ;;
         -h|--help) usage; exit 0 ;;
@@ -86,14 +95,10 @@ fi
 
 mkdir -p "$BIN_DIR" "$DATA_DIR" "$PW_CONF_DIR"
 
-# Downloads the native atmos-decode (no .NET needed). Returns non-zero if unavailable.
-download_decoder() {
-    [[ $(uname -m) == x86_64 ]] || { echo "No prebuilt binary for $(uname -m)." >&2; return 1; }
-    local name=atmos-decode-linux-x64 tmp
-    # x86-64-v3 build when the CPU has AVX2 + FMA + BMI2 (Intel Haswell / AMD Zen and newer)
-    if grep -qw avx2 /proc/cpuinfo && grep -qw fma /proc/cpuinfo && grep -qw bmi2 /proc/cpuinfo; then
-        name+=-v3
-    fi
+# Downloads a prebuilt release asset to <dest> and checks it against SHA256SUMS.
+# Returns non-zero if it isn't available.
+download_asset() { # <asset name> <dest>
+    local name=$1 tmp
     tmp=$(mktemp -d)
     note "Downloading $name"
     if ! curl -fsSL --retry 3 -o "$tmp/$name" "$RELEASE_URL/$name" ||
@@ -103,15 +108,28 @@ download_decoder() {
     if ! (cd "$tmp" && grep " $name\$" SHA256SUMS | sha256sum -c --quiet -); then
         rm -rf "$tmp"; echo "Checksum mismatch for $name." >&2; return 1
     fi
-    rm -rf "$DATA_DIR/decoder"
-    mkdir -p "$DATA_DIR/decoder"
-    install -m 755 "$tmp/$name" "$DATA_DIR/decoder/atmos-decode"
+    mkdir -p "$(dirname -- "$2")"
+    install -m 755 "$tmp/$name" "$2"
     rm -rf "$tmp"
+}
+
+# Downloads the native atmos-decode (no .NET needed). Returns non-zero if unavailable.
+download_decoder() {
+    [[ $(uname -m) == x86_64 ]] || { echo "No prebuilt binary for $(uname -m)." >&2; return 1; }
+    local name=atmos-decode-linux-x64
+    # x86-64-v3 build when the CPU has AVX2 + FMA + BMI2 (Intel Haswell / AMD Zen and newer)
+    if grep -qw avx2 /proc/cpuinfo && grep -qw fma /proc/cpuinfo && grep -qw bmi2 /proc/cpuinfo; then
+        name+=-v3
+    fi
+    rm -rf "$DATA_DIR/decoder"
+    download_asset "$name" "$DATA_DIR/decoder/atmos-decode"
 }
 
 build_decoder() {
     command -v dotnet >/dev/null || die "'dotnet' missing. On Arch: sudo pacman -S dotnet-sdk (or use --skip-decoder)"
-    note "Building atmos-decode (downloads Cavern from NuGet on first build)"
+    command -v git >/dev/null || die "'git' missing (needed to fetch Cavern)"
+    note "Building atmos-decode (Cavern 2.1 + linux-atmos CPU patch)"
+    "$ROOT/decoder/cavern/get-cavern.sh"
     rm -rf "$DATA_DIR/decoder"
     DOTNET_NOLOGO=1 DOTNET_CLI_TELEMETRY_OPTOUT=1 \
         dotnet publish "$ROOT/decoder/AtmosDecode.csproj" -c Release -o "$DATA_DIR/decoder" --nologo -v quiet
@@ -133,6 +151,37 @@ else
 fi
 
 install -m 755 "$ROOT/bin/atmos-play" "$BIN_DIR/atmos-play"
+
+if ((MPV)); then
+    command -v mpv >/dev/null || die "'mpv' missing. On Arch: sudo pacman -S mpv"
+    ((SKIP_DECODER)) && die "--mpv needs atmos-decode (drop --skip-decoder)"
+    install -m 755 "$ROOT/bin/atmos-stream" "$BIN_DIR/atmos-stream"
+    # TrueHD Atmos decoder
+    if ((FROM_SOURCE)) || [[ $(uname -m) != x86_64 ]] ||
+       ! download_asset thd-atmos-linux-x64 "$DATA_DIR/thd-atmos"; then
+        command -v cargo >/dev/null || die "Prebuilt thd-atmos unavailable and 'cargo' missing (sudo pacman -S rust)."
+        note "Building thd-atmos (needs ~11 GB of RAM)"
+        (cd "$ROOT/thd-atmos" && cargo build --release --locked -j 1)
+        install -m 755 "$ROOT/thd-atmos/target/release/thd-atmos" "$DATA_DIR/thd-atmos"
+    fi
+    ln -sf "$DATA_DIR/thd-atmos" "$BIN_DIR/thd-atmos"
+    "$BIN_DIR/thd-atmos" --positions >/dev/null || die "thd-atmos does not run on this system"
+
+    mkdir -p "$MPV_DIR/scripts"
+    install -m 644 "$ROOT/mpv/scripts/atmos-live.lua" "$MPV_DIR/scripts/atmos-live.lua"
+    rm -f "$MPV_DIR/scripts/atmos-auto.lua"   # older background-conversion script
+    touch "$MPV_DIR/mpv.conf"
+    sed -i '/# >>> linux-atmos >>>/,/# <<< linux-atmos <<</d' "$MPV_DIR/mpv.conf"
+    cat >> "$MPV_DIR/mpv.conf" <<'CONF'
+# >>> linux-atmos >>>
+# mpv -> 12-ch "Atmos Headphones" sink; the file's own layout is passed through
+# (7.1.4 live Atmos, 7.1 / 5.1 films, stereo music).
+audio-device=pipewire/effect_input.atmos_headphones
+audio-channels=auto
+# <<< linux-atmos <<<
+CONF
+    note "mpv: Atmos tracks now play with live height channels (Ctrl+a toggles)"
+fi
 
 if [[ -z $SOFA_FILE ]]; then
     SOFA_FILE="$DATA_DIR/hrtf.sofa"

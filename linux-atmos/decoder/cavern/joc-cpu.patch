@@ -1,0 +1,175 @@
+Cavern 2.1 (https://github.com/VoidXH/Cavern, tag 2.1) - CPU optimisations of the E-AC-3 Joint Object
+Coding decoder, used by linux-atmos/atmos-decode. Output is bit-identical to unmodified Cavern 2.1.
+
+1. JOC transforms and matrix interpolation run sequentially instead of handing ~16,000 tiny jobs per
+   second to the thread pool: the synchronisation cost more CPU than the work.
+2. GetMixingMatrices copied the "previous matrix" once per timeslot (24x per frame) with the same result.
+3. Objects whose mixing matrix stayed zero long enough to flush the inverse QMF bank's history output
+   exact silence, so their transform is skipped (programs often carry permanently unused objects).
+
+Cavern is (c) VoidX, http://en.sbence.hu, free for non-commercial use under its licence:
+https://github.com/VoidXH/Cavern/blob/master/LICENSE.md. This modified version is distributed under
+the same terms.
+
+diff --git a/Cavern.Format/Decoders/EnhancedAC3/JointObjectCodingApplier.cs b/Cavern.Format/Decoders/EnhancedAC3/JointObjectCodingApplier.cs
+index a7a537d..032f53d 100644
+--- a/Cavern.Format/Decoders/EnhancedAC3/JointObjectCodingApplier.cs
++++ b/Cavern.Format/Decoders/EnhancedAC3/JointObjectCodingApplier.cs
+@@ -54,6 +54,16 @@ namespace Cavern.Format.Decoders.EnhancedAC3 {
+         /// </summary>
+         int timeslot;
+ 
++        /// <summary>
++        /// Number of consecutive timeslots each object's mixing matrix was zero.
++        /// </summary>
++        readonly int[] silentTimeslots = new int[64];
++
++        /// <summary>
++        /// Zero timeslots after which the inverse QMFB's history (10 timeslots long) is surely empty.
++        /// </summary>
++        const int silenceToSkip = 11;
++
+         /// <summary>
+         /// Creates a converter from a channel-based audio stream and JOC to object output samples.
+         /// </summary>
+@@ -87,45 +97,42 @@ namespace Cavern.Format.Decoders.EnhancedAC3 {
+             }
+ 
+             // Forward transformations
+-            int runs = joc.ChannelCount;
+-            taskWaiter.Reset();
++            // Sequential: each job is ~1 µs of work per 64-sample timeslot, so handing them to the
++            // thread pool cost more CPU in synchronisation than the work itself.
+             for (int ch = 0; ch < joc.ChannelCount; ++ch) {
+-                ThreadPool.QueueUserWorkItem(channel => {
+-                    int ch = (int)channel;
+-                    fixed (float* pInput = input[ch]) {
+-                        if (!mono) {
+-                            results[ch] = converters[ch].ProcessForward(pInput);
+-                        } else {
+-                            results[ch] = converters[ch].ProcessForward_Mono(pInput);
+-                        }
+-                    }
+-                    if (Interlocked.Decrement(ref runs) == 0) {
+-                        taskWaiter.Set();
++                fixed (float* pInput = input[ch]) {
++                    if (!mono) {
++                        results[ch] = converters[ch].ProcessForward(pInput);
++                    } else {
++                        results[ch] = converters[ch].ProcessForward_Mono(pInput);
+                     }
+-                }, ch);
++                }
+             }
+-            taskWaiter.Wait();
+ 
+             // Inverse transformations
+             int objects = joc.ObjectCount;
+-            runs = objects;
+-            taskWaiter.Reset();
+             for (int obj = 0; obj < objects; ++obj) {
+-                ThreadPool.QueueUserWorkItem(objectIndex => {
+-                    int obj = (int)objectIndex;
+-                    if (CavernAmp.Available) {
+-                        ProcessObject_Amp(joc, obj, mixMatrix[obj][timeslot], joc.Gain);
+-                    } else if (!mono) {
+-                        ProcessObject(joc, obj, mixMatrix[obj][timeslot], joc.Gain);
+-                    } else {
+-                        ProcessObject_Mono(joc, obj, mixMatrix[obj][timeslot], joc.Gain);
+-                    }
+-                    if (Interlocked.Decrement(ref runs) == 0) {
+-                        taskWaiter.Set();
++                // An object whose mixing matrix stayed zero long enough for the inverse QMFB's history
++                // to only hold zeros outputs exact silence: skip its transform (many programs carry
++                // permanently unused objects).
++                if (IsZero(mixMatrix[obj][timeslot])) {
++                    if (++silentTimeslots[obj] > silenceToSkip) {
++                        if (silentTimeslots[obj] == silenceToSkip + 1) {
++                            Array.Clear(timeslotCache[obj], 0, timeslotCache[obj].Length);
++                        }
++                        continue;
+                     }
+-                }, obj);
++                } else {
++                    silentTimeslots[obj] = 0;
++                }
++                if (CavernAmp.Available) {
++                    ProcessObject_Amp(joc, obj, mixMatrix[obj][timeslot], joc.Gain);
++                } else if (!mono) {
++                    ProcessObject(joc, obj, mixMatrix[obj][timeslot], joc.Gain);
++                } else {
++                    ProcessObject_Mono(joc, obj, mixMatrix[obj][timeslot], joc.Gain);
++                }
+             }
+-            taskWaiter.Wait();
+ 
+             if (++timeslot == input.Length) {
+                 timeslot = 0;
+@@ -133,6 +140,21 @@ namespace Cavern.Format.Decoders.EnhancedAC3 {
+             return timeslotCache;
+         }
+ 
++        /// <summary>
++        /// Checks if all mixing coefficients of an object's timeslot are zero.
++        /// </summary>
++        static bool IsZero(float[][] matrix) {
++            for (int ch = 0; ch < matrix.Length; ch++) {
++                float[] channel = matrix[ch];
++                for (int sb = 0; sb < channel.Length; sb++) {
++                    if (channel[sb] != 0) {
++                        return false;
++                    }
++                }
++            }
++            return true;
++        }
++
+         /// <summary>
+         /// Free up resources used by this object.
+         /// </summary>
+diff --git a/Cavern.Format/Decoders/EnhancedAC3/JointObjectCodingDecoder.cs b/Cavern.Format/Decoders/EnhancedAC3/JointObjectCodingDecoder.cs
+index 24e11f5..e9475e6 100644
+--- a/Cavern.Format/Decoders/EnhancedAC3/JointObjectCodingDecoder.cs
++++ b/Cavern.Format/Decoders/EnhancedAC3/JointObjectCodingDecoder.cs
+@@ -214,13 +214,12 @@ namespace Cavern.Format.Decoders.EnhancedAC3 {
+                 }
+             }
+ 
+-            for (int ts = 0; ts < timeslots; ts++) {
+-                for (int ch = 0; ch < ChannelCount; ch++) {
+-                    float[] channelPrev = prevMatrix[ch];
+-                    float[] mixSource = mixMatrix[dataPoints[obj] - 1][ch];
+-                    for (byte sb = 0; sb < QuadratureMirrorFilterBank.subbands; sb++) {
+-                        channelPrev[sb] = mixSource[pbMapping[sb]];
+-                    }
++            // Was repeated for every timeslot with the same result
++            for (int ch = 0; ch < ChannelCount; ch++) {
++                float[] channelPrev = prevMatrix[ch];
++                float[] mixSource = mixMatrix[dataPoints[obj] - 1][ch];
++                for (byte sb = 0; sb < QuadratureMirrorFilterBank.subbands; sb++) {
++                    channelPrev[sb] = mixSource[pbMapping[sb]];
+                 }
+             }
+         }
+@@ -231,20 +230,9 @@ namespace Cavern.Format.Decoders.EnhancedAC3 {
+         /// <param name="frameSize">Length of the entire time window of all time slots</param>
+         public float[][][][] GetMixingMatrices(int frameSize) {
+             int qmfTimeslots = frameSize / QuadratureMirrorFilterBank.subbands;
+-            int runs = ObjectCount;
+-            taskWaiter.Reset();
+             for (int obj = 0; obj < ObjectCount; obj++) {
+-                ThreadPool.QueueUserWorkItem(
+-                   new WaitCallback(objIndex => {
+-                       int obj = (int)objIndex;
+-                       GetMixingMatrices(obj, qmfTimeslots, mixMatrix[obj],
+-                           interpolatedMatrix[obj], prevMatrix[obj]);
+-                       if (Interlocked.Decrement(ref runs) == 0) {
+-                           taskWaiter.Set();
+-                       }
+-                   }), obj);
++                GetMixingMatrices(obj, qmfTimeslots, mixMatrix[obj], interpolatedMatrix[obj], prevMatrix[obj]);
+             }
+-            taskWaiter.Wait();
+             return interpolatedMatrix;
+         }
+     }

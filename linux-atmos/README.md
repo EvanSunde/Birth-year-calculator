@@ -59,7 +59,7 @@ mpv --audio-device=pipewire/effect_input.atmos_headphones --audio-channels=7.1 m
 ```
 
 Plain mpv/FFmpeg only decode the 5.1/7.1 core of an Atmos stream. For the height objects use
-`atmos-play`, or pipe `atmos-decode` yourself:
+mpv with live decoding (below), `atmos-play`, or pipe `atmos-decode` yourself:
 
 ```sh
 ffmpeg -i song.m4a -map 0:a:0 -c copy -f eac3 - | atmos-decode - |
@@ -67,6 +67,27 @@ ffmpeg -i song.m4a -map 0:a:0 -c copy -f eac3 - | atmos-decode - |
           --channels 12 --channel-map "$(atmos-decode --positions)" -
 # (PipeWire <= 1.0: drop --raw)
 ```
+
+### mpv with live Atmos decoding
+
+`./install.sh --mpv` adds `mpv/scripts/atmos-live.lua`. When the selected audio track is Atmos
+(E-AC-3 + JOC, or TrueHD Atmos), it decodes the heights in real time from the current position and
+plays them as an extra audio track, so pause, seek and speed all keep working:
+
+```
+mpv film.mkv → Atmos track? → atmos-stream <file> <track> <time>     (restarted on every seek)
+   ffmpeg -c copy (cut at the exact frame) → atmos-decode --mka       E-AC-3 + JOC (Cavern)
+                                          → thd-atmos | atmos-decode --wrap-pcm   TrueHD Atmos
+   → live Matroska track, 7.1.4 float PCM with film timestamps → mpv → Atmos Headphones sink
+```
+
+* After a seek, the core 5.1/7.1 track plays for about half a second while the decoder restarts.
+* **Ctrl+a** switches between the Atmos heights and the core audio.
+* Options go in `~/.config/mpv/script-opts/atmos_live.conf`: `enabled=yes|no`, `force=yes`
+  (treat every E-AC-3/TrueHD track as Atmos), `preroll=0.3`.
+* If anything fails, mpv keeps playing the core audio and logs `atmos-stream: ...` (`mpv -v`).
+* The installer's `mpv.conf` block sends **all** mpv audio to the Atmos Headphones sink. Remove
+  `audio-device=` there if you also use mpv with speakers.
 
 ### Where do I get Atmos music files?
 
@@ -79,8 +100,8 @@ download or decrypt anything.
 * The **"Atmos Headphones" sink** is part of PipeWire's config, so it starts with PipeWire on
   every login. There's nothing extra to keep running. Anything played to it (7.1.4, 7.1, 5.1 or
   stereo) is virtualised for headphones.
-* **The height objects are only decoded when you play through `atmos-play`.** Other players
-  (mpv, browsers, Strawberry, …) decode E-AC-3 with FFmpeg, which discards the Atmos objects
+* **The height objects are only decoded through `atmos-play` or mpv with `--mpv`.** Other
+  players (browsers, Strawberry, …) decode E-AC-3 with FFmpeg, which discards the Atmos objects
   and outputs the 5.1 core. Played to the sink, that still gives surround on headphones, with
   the height sounds folded into the ear-level speakers. Apps hand PipeWire already-decoded PCM,
   so a background service can't intercept the Atmos stream to add the heights back.
@@ -89,21 +110,32 @@ download or decrypt anything.
 ## CPU use
 
 Measured on a 3.6-minute Apple Music Atmos track (E-AC-3 JOC, 5.1 core + 16 objects, 768 kb/s)
-on a cloud vCPU:
+on a 4-vCPU cloud machine (a laptop core is usually faster):
 
-| | CPU time for the whole track | average load |
+| | before | now |
 |---|---|---|
-| `atmos-decode` (5.1 core + 16 objects → 7.1.4) | ~38 s | ~17% of one core |
-| FFmpeg, 5.1 core only (no heights), for comparison | ~0.9 s | <1% |
-| HRTF sink (11 convolutions in PipeWire) | ~0.3 s per 30 s played | ~1% of one core, 0 when idle |
+| `atmos-decode`, 40 s of audio (CPU time) | ~12.2 s | ~3.8 s (3.2× less) |
+| mpv live Atmos, whole pipeline incl. mpv, while playing | ~40% of one core | ~17% of one core |
+| `thd-atmos` (TrueHD), 60 s of 5.1 TrueHD | 8.8 s | 2.1 s (4.1× less) |
+| HRTF sink (11 convolutions in PipeWire) | ~1% of one core, 0 when idle | same |
 
-Nearly all of the cost is Cavern's Joint Object Coding decoder, which runs its QMF filterbanks
-as direct matrix products. The renderer quality setting and block size make no measurable
-difference. The native (AOT) build has the same throughput as the JIT build but starts in 30 ms
-instead of 100 ms. Its output is sample-identical on AVX2, and within float rounding (−136 dBFS)
-on the baseline build.
+What changed (all output is bit-identical to before, checked over whole tracks):
 
-## Tuning
+* **Cavern's JOC decoder** ran each 64-sample time slot's transforms as ~22 thread-pool jobs,
+  about 16,000 hand-offs per second; the synchronisation cost more CPU than the maths. It now
+  runs them sequentially, skips objects that are silent (4 of 16 in the track above are unused
+  for the whole song), and no longer repeats a matrix copy 24 times per frame.
+  See [decoder/cavern/joc-cpu.patch](decoder/cavern/joc-cpu.patch).
+* **mpv pipeline:** `atmos-decode` writes the timestamped Matroska track itself (A_MS/ACM, which
+  carries the 7.1.4 channel mask). Previously a second FFmpeg re-encoded the decoder output to
+  WavPack and mpv decoded it again, which cost about as much as the decoder.
+* **Native decoder** (.NET NativeAOT) instead of the .NET runtime: no JIT on every seek restart,
+  30 ms start-up.
+* **Decoder timing:** JOC objects come out of Cavern 576 samples (12 ms) late. The live track's
+  timestamps now compensate for it, so the heights line up with the picture and the core audio.
+* **thd-atmos** is built with the `truehd` crate optimised (opt-level 1) instead of opt-level 0.
+
+## Tuning## Tuning
 
 * **HRTF**: externalisation depends on how well the HRTF matches your ears. Try other SOFA files
   (the [SOFA database list](https://www.sofaconventions.org/mediawiki/index.php/Files) has
@@ -130,18 +162,21 @@ Plus + Dolby Atmos": 7-ch core, 11 JOC objects + LFE), a full Apple Music Atmos 
 
 Known limits:
 
-* **TrueHD Atmos**: Cavern 2.1 can't decode TrueHD audio yet, so headphone mode plays the TrueHD
-  7.1 bed via FFmpeg. Use `--passthrough` with a receiver, or try
-  [truehdd](https://github.com/truehdd/truehdd) → `.atmos` → `atmos-play file.atmos`
-  (untested).
+* **TrueHD Atmos**: Cavern can't decode TrueHD audio, so `atmos-play` plays the TrueHD 7.1 bed via
+  FFmpeg. mpv with `--mpv` decodes TrueHD Atmos objects with `thd-atmos` (the experimental
+  `truehd` crate; tested on FFmpeg-encoded streams only, no real Atmos TrueHD). Use
+  `--passthrough` with a receiver for the reference decode.
 * PipeWire builds without libmysofa can't load the sink. Arch's package includes it.
 * No head tracking, and no Dolby room/EQ model. Objects are rendered to 7.1.4 before
   binauralisation.
 
 ## Licences
 
-* [Cavern](https://github.com/VoidXH/Cavern) is downloaded from NuGet at build time and is
-  under its own licence, which allows free non-commercial use and forbids selling it.
+* [Cavern](https://github.com/VoidXH/Cavern) by VoidX (http://en.sbence.hu) is fetched at build
+  time (tag 2.1) and patched with [decoder/cavern/joc-cpu.patch](decoder/cavern/joc-cpu.patch).
+  Its licence allows free non-commercial use and modified versions released for free with a
+  link to the original, and forbids selling it.
+* `thd-atmos` uses the [truehd](https://github.com/truehdd/truehdd) crate (Apache-2.0).
 * The default HRTF (ARI database) is CC BY-SA 3.0, Acoustics Research Institute, Austrian
   Academy of Sciences.
 * Dolby, Dolby Atmos and Dolby Access are trademarks of Dolby Laboratories. This project

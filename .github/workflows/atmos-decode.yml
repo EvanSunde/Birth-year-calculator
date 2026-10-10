@@ -1,12 +1,14 @@
-# Builds atmos-decode as native Linux executables (.NET NativeAOT: no .NET runtime needed)
-# and publishes them on the "atmos-decode-latest" release, where linux-atmos/install.sh
-# downloads them from.
+# Builds the linux-atmos decoders as native Linux executables and publishes them on the
+# "atmos-decode-latest" release, where linux-atmos/install.sh downloads them from:
+#   atmos-decode  E-AC-3 Atmos (Cavern 2.1 + linux-atmos CPU patch, .NET NativeAOT: needs only libc)
+#   thd-atmos     TrueHD Atmos (Rust, truehd crate)
 name: atmos-decode
 
 on:
   push:
     paths:
       - linux-atmos/decoder/**
+      - linux-atmos/thd-atmos/**
       - .github/workflows/atmos-decode.yml
   workflow_dispatch:
 
@@ -18,7 +20,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  atmos-decode:
     # Oldest supported runner: the binaries need glibc >= 2.35
     runs-on: ubuntu-22.04
     steps:
@@ -29,7 +31,10 @@ jobs:
           dotnet-version: 8.0.x
 
       - name: Install NativeAOT toolchain
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang zlib1g-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang zlib1g-dev ffmpeg
+
+      - name: Fetch and patch Cavern
+        run: linux-atmos/decoder/cavern/get-cavern.sh
 
       - name: Build
         working-directory: linux-atmos/decoder
@@ -38,7 +43,7 @@ jobs:
           DOTNET_CLI_TELEMETRY_OPTOUT: 1
         run: |
           mkdir -p "$GITHUB_WORKSPACE/dist"
-          aot="-c Release -r linux-x64 -p:PublishAot=true"
+          aot="-c Release -r linux-x64"
           # x86-64-v3 (AVX2, Haswell/Zen and newer) is ~20% faster
           dotnet publish $aot -p:IlcInstructionSet=x86-x64-v3 -o out-v3
           # Baseline x86-64 fallback (the default instruction set)
@@ -48,10 +53,9 @@ jobs:
           cp out-baseline/atmos-decode "$GITHUB_WORKSPACE/dist/atmos-decode-linux-x64"
 
       - name: Smoke test
+        working-directory: dist
         run: |
           set -euo pipefail
-          ffmpeg -version >/dev/null 2>&1 || sudo apt-get install -y -qq ffmpeg
-          cd dist
           ffmpeg -v error -f lavfi -i "sine=f=440:d=1" -ac 6 -c:a eac3 -b:a 384k -f eac3 test.eac3
           for bin in atmos-decode-linux-x64 atmos-decode-linux-x64-v3; do
             chmod +x "$bin"
@@ -59,23 +63,74 @@ jobs:
             bytes=$("./$bin" test.eac3 | wc -c)
             echo "$bin: $bytes bytes"
             test "$bytes" -gt 1000000
+            "./$bin" --mka 1.5 - < test.eac3 > test.mka
+            ffprobe -v error -show_entries stream=channel_layout:format=start_time -of compact test.mka | tee probe.txt
+            grep -q "channel_layout=7.1.4" probe.txt
           done
-          rm test.eac3
-          sha256sum atmos-decode-* > SHA256SUMS
-          cat SHA256SUMS
+          rm test.eac3 test.mka probe.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atmos-decode
+          path: dist/
+
+  thd-atmos:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Build
+        working-directory: linux-atmos/thd-atmos
+        # One job: compiling the truehd crate optimised peaks at ~11 GB of RAM (runners have 16)
+        run: cargo build --release --locked -j 1
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          bin=linux-atmos/thd-atmos/target/release/thd-atmos
+          "$bin" --positions
+          ffmpeg -v error -f lavfi -i "sine=f=440:d=2" -ac 6 -ar 48000 -strict -2 -c:a truehd -f truehd test.thd
+          bytes=$("$bin" < test.thd | wc -c)
+          echo "thd-atmos: $bytes bytes"
+          test "$bytes" -gt 1000000
+          mkdir -p dist && cp "$bin" dist/thd-atmos-linux-x64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thd-atmos
+          path: dist/
+
+  release:
+    needs: [atmos-decode, thd-atmos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
+          cd dist
+          sha256sum atmos-decode-* thd-atmos-* > SHA256SUMS
+          cat SHA256SUMS
           tag=atmos-decode-latest
-          notes="Native atmos-decode built from ${GITHUB_SHA} (${GITHUB_REF_NAME}).
+          notes="Native linux-atmos decoders built from ${GITHUB_SHA} (${GITHUB_REF_NAME}).
 
-          Uses Cavern by VoidX (http://en.sbence.hu, https://github.com/VoidXH/Cavern), free for
-          non-commercial use under its licence: https://github.com/VoidXH/Cavern/blob/master/LICENSE.md"
+          atmos-decode uses Cavern by VoidX (http://en.sbence.hu, https://github.com/VoidXH/Cavern), version 2.1
+          with the CPU patch in linux-atmos/decoder/cavern/joc-cpu.patch. Free for non-commercial use under
+          Cavern's licence: https://github.com/VoidXH/Cavern/blob/master/LICENSE.md
+          thd-atmos uses the truehd crate (https://crates.io/crates/truehd)."
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release edit "$tag" --notes "$notes"
           else
             gh release create "$tag" --prerelease --target "$GITHUB_SHA" --title "atmos-decode (latest build)" --notes "$notes"
           fi
-          gh release upload "$tag" dist/* --clobber
+          gh release upload "$tag" atmos-decode-* thd-atmos-* SHA256SUMS --clobber

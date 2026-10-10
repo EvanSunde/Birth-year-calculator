@@ -1,0 +1,18 @@
+[package]
+name = "thd-atmos"
+version = "0.1.0"
+edition = "2024"
+description = "Real-time Dolby TrueHD Atmos -> 7.1.4 renderer (stdin TrueHD, stdout f32le)"
+
+[dependencies]
+truehd = "0.7.2"
+
+[profile.release]
+opt-level = 3
+codegen-units = 16
+
+# Compiling the truehd crate at opt-level 2-3 needs more than 14 GB of RAM. Level 1 builds in about
+# 11 GB (`cargo build --release -j 1`) and is ~4x faster than level 0: 2.1 vs 8.8 s of CPU per
+# minute of 5.1 TrueHD.
+[profile.release.package.truehd]
+opt-level = 1

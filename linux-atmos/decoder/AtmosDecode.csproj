@@ -10,14 +10,23 @@
     <!-- Run on whatever newer .NET runtime the distro ships (Arch: dotnet-runtime) -->
     <RollForward>Major</RollForward>
     <ServerGarbageCollector>false</ServerGarbageCollector>
-    <!-- Native builds (dotnet publish -r linux-x64 -p:PublishAot=true, as in CI): one
-         self-contained executable that only needs libc -->
+    <!-- With a runtime identifier (dotnet publish -r linux-x64, as in CI) the result is a native
+         executable that only needs libc. Set here, not on the command line, so it doesn't apply
+         to the Cavern library projects. -->
+    <PublishAot Condition="'$(RuntimeIdentifier)' != ''">true</PublishAot>
     <StripSymbols>true</StripSymbols>
     <Description>Decodes Dolby Atmos (E-AC-3 + JOC, Dolby Atmos Master Format) with Cavern and streams speaker-rendered PCM to stdout.</Description>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Cavern by VoidX: https://github.com/VoidXH/Cavern (free for non-commercial use, see its LICENSE.md) -->
-    <PackageReference Include="Cavern.Format" Version="2.1.0" />
+    <!-- Cavern by VoidX: https://github.com/VoidXH/Cavern (free for non-commercial use, see its LICENSE.md).
+         Cavern 2.1 with linux-atmos's CPU patch; run cavern/get-cavern.sh first. -->
+    <ProjectReference Include="cavern/src/Cavern.Format/Cavern.Format.csproj" />
+  </ItemGroup>
+
+  <!-- Don't compile the Cavern checkout's own sources into this project -->
+  <ItemGroup>
+    <Compile Remove="cavern/**" />
+    <None Remove="cavern/**" />
   </ItemGroup>
 </Project>
