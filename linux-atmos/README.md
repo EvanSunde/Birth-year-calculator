@@ -24,14 +24,17 @@ actually does (see [docs/how-dolby-access-works.md](docs/how-dolby-access-works.
 ## Install (Arch Linux)
 
 ```sh
-sudo pacman -S --needed pipewire wireplumber ffmpeg dotnet-sdk
+sudo pacman -S --needed pipewire wireplumber ffmpeg
 sudo pacman -S --needed mpv          # optional: HDMI passthrough to an AV receiver
 ./install.sh
 ```
 
 The installer:
 
-1. builds `atmos-decode` (pulls the Cavern library from NuGet) into `~/.local/share/linux-atmos`,
+1. downloads a prebuilt native `atmos-decode` (8.7 MB, no .NET needed, checksum-verified) from
+   this repo's `atmos-decode-latest` release into `~/.local/share/linux-atmos`. It picks the
+   AVX2 build on CPUs from about 2015 onwards. `--build-from-source` builds it with `dotnet-sdk`
+   instead, which is also the automatic fallback if the download fails,
 2. downloads a default HRTF set (ARI NH724, CC BY-SA 3.0) unless you pass `--sofa <file>`,
 3. writes the sink to `~/.config/pipewire/pipewire.conf.d/atmos-headphones.conf` and restarts
    PipeWire,
@@ -71,6 +74,35 @@ Streaming services (Tidal, Amazon Music, Apple Music) deliver Dolby Atmos music 
 Blu-ray audio discs use TrueHD Atmos. Use files you are entitled to play. This project doesn't
 download or decrypt anything.
 
+## How it runs (no daemon needed)
+
+* The **"Atmos Headphones" sink** is part of PipeWire's config, so it starts with PipeWire on
+  every login. There's nothing extra to keep running. Anything played to it (7.1.4, 7.1, 5.1 or
+  stereo) is virtualised for headphones.
+* **The height objects are only decoded when you play through `atmos-play`.** Other players
+  (mpv, browsers, Strawberry, …) decode E-AC-3 with FFmpeg, which discards the Atmos objects
+  and outputs the 5.1 core. Played to the sink, that still gives surround on headphones, with
+  the height sounds folded into the ear-level speakers. Apps hand PipeWire already-decoded PCM,
+  so a background service can't intercept the Atmos stream to add the heights back.
+* `atmos-play` has no pause/seek: stop with Ctrl+C.
+
+## CPU use
+
+Measured on a 3.6-minute Apple Music Atmos track (E-AC-3 JOC, 5.1 core + 16 objects, 768 kb/s)
+on a cloud vCPU:
+
+| | CPU time for the whole track | average load |
+|---|---|---|
+| `atmos-decode` (5.1 core + 16 objects → 7.1.4) | ~38 s | ~17% of one core |
+| FFmpeg, 5.1 core only (no heights), for comparison | ~0.9 s | <1% |
+| HRTF sink (11 convolutions in PipeWire) | ~0.3 s per 30 s played | ~1% of one core, 0 when idle |
+
+Nearly all of the cost is Cavern's Joint Object Coding decoder, which runs its QMF filterbanks
+as direct matrix products. The renderer quality setting and block size make no measurable
+difference. The native (AOT) build has the same throughput as the JIT build but starts in 30 ms
+instead of 100 ms. Its output is sample-identical on AVX2, and within float rounding (−136 dBFS)
+on the baseline build.
+
 ## Tuning
 
 * **HRTF**: externalisation depends on how well the HRTF matches your ears. Try other SOFA files
@@ -86,7 +118,8 @@ download or decrypt anything.
 ## Status / what was verified
 
 Tested on PipeWire 1.0.5 with FFmpeg's `the_great_wall_7.1.eac3` sample (profile "Dolby Digital
-Plus + Dolby Atmos": 7-ch core, 11 JOC objects + LFE) and synthetic test tones:
+Plus + Dolby Atmos": 7-ch core, 11 JOC objects + LFE), a full Apple Music Atmos track (5.1 core,
+16 objects, with real content on all four height channels) and synthetic test tones:
 
 * `atmos-decode` decodes the JOC objects and OAMD positions. Bed channel levels match FFmpeg's
   core decode, and file input and piped input give byte-identical output.

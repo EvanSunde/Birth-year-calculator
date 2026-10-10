@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Installs linux-atmos for the current user:
-#   ~/.local/bin/atmos-decode   Cavern-based Atmos decoder (built from decoder/)
+#   ~/.local/bin/atmos-decode   Cavern-based Atmos decoder (prebuilt native binary, or built from decoder/)
 #   ~/.local/bin/atmos-play     player script
-#   ~/.local/share/linux-atmos/ HRTF (SOFA) file + decoder binaries
+#   ~/.local/share/linux-atmos/ HRTF (SOFA) file + decoder binary
 #   ~/.config/pipewire/pipewire.conf.d/atmos-headphones.conf   the binaural sink
 #
-# Arch Linux dependencies:  sudo pacman -S --needed pipewire ffmpeg dotnet-sdk
+# Arch Linux dependencies:  sudo pacman -S --needed pipewire ffmpeg
 # Optional (HDMI passthrough to an AV receiver): sudo pacman -S mpv
+# Only for --build-from-source: sudo pacman -S dotnet-sdk
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,6 +26,10 @@ HRTF_GAIN="0.5"
 LFE_GAIN="0.5"
 RESTART=1
 SKIP_DECODER=0
+FROM_SOURCE=0
+
+# Native atmos-decode builds published by .github/workflows/atmos-decode.yml
+RELEASE_URL="${ATMOS_RELEASE_URL:-https://github.com/EvanSunde/Birth-year-calculator/releases/download/atmos-decode-latest}"
 
 usage() {
     cat <<EOF
@@ -34,7 +39,8 @@ Usage: ./install.sh [options]
   --radius <m>         Measurement distance of the SOFA file (default $HRTF_RADIUS)
   --hrtf-gain <x>      Gain of each virtual speaker (default $HRTF_GAIN)
   --lfe-gain <x>       Gain of the LFE channel into both ears (default $LFE_GAIN)
-  --skip-decoder       Don't build atmos-decode (FFmpeg-only playback: 7.1, no height)
+  --build-from-source  Build atmos-decode with dotnet-sdk instead of downloading the prebuilt binary
+  --skip-decoder       Don't install atmos-decode (FFmpeg-only playback: no height channels)
   --no-restart         Don't restart PipeWire after installing the sink
   --uninstall          Remove everything this script installed
 EOF
@@ -56,6 +62,7 @@ while (($#)); do
         --hrtf-gain) HRTF_GAIN="${2:?}"; shift ;;
         --lfe-gain) LFE_GAIN="${2:?}"; shift ;;
         --skip-decoder) SKIP_DECODER=1 ;;
+        --build-from-source) FROM_SOURCE=1 ;;
         --no-restart) RESTART=0 ;;
         --uninstall) uninstall; exit 0 ;;
         -h|--help) usage; exit 0 ;;
@@ -79,15 +86,50 @@ fi
 
 mkdir -p "$BIN_DIR" "$DATA_DIR" "$PW_CONF_DIR"
 
-if ((SKIP_DECODER)); then
-    note "Skipping atmos-decode"
-else
+# Downloads the native atmos-decode (no .NET needed). Returns non-zero if unavailable.
+download_decoder() {
+    [[ $(uname -m) == x86_64 ]] || { echo "No prebuilt binary for $(uname -m)." >&2; return 1; }
+    local name=atmos-decode-linux-x64 tmp
+    # x86-64-v3 build when the CPU has AVX2 + FMA + BMI2 (Intel Haswell / AMD Zen and newer)
+    if grep -qw avx2 /proc/cpuinfo && grep -qw fma /proc/cpuinfo && grep -qw bmi2 /proc/cpuinfo; then
+        name+=-v3
+    fi
+    tmp=$(mktemp -d)
+    note "Downloading $name"
+    if ! curl -fsSL --retry 3 -o "$tmp/$name" "$RELEASE_URL/$name" ||
+       ! curl -fsSL --retry 3 -o "$tmp/SHA256SUMS" "$RELEASE_URL/SHA256SUMS"; then
+        rm -rf "$tmp"; echo "Download failed." >&2; return 1
+    fi
+    if ! (cd "$tmp" && grep " $name\$" SHA256SUMS | sha256sum -c --quiet -); then
+        rm -rf "$tmp"; echo "Checksum mismatch for $name." >&2; return 1
+    fi
+    rm -rf "$DATA_DIR/decoder"
+    mkdir -p "$DATA_DIR/decoder"
+    install -m 755 "$tmp/$name" "$DATA_DIR/decoder/atmos-decode"
+    rm -rf "$tmp"
+}
+
+build_decoder() {
     command -v dotnet >/dev/null || die "'dotnet' missing. On Arch: sudo pacman -S dotnet-sdk (or use --skip-decoder)"
     note "Building atmos-decode (downloads Cavern from NuGet on first build)"
+    rm -rf "$DATA_DIR/decoder"
     DOTNET_NOLOGO=1 DOTNET_CLI_TELEMETRY_OPTOUT=1 \
         dotnet publish "$ROOT/decoder/AtmosDecode.csproj" -c Release -o "$DATA_DIR/decoder" --nologo -v quiet
     rm -rf "$ROOT/decoder/bin" "$ROOT/decoder/obj"
+}
+
+if ((SKIP_DECODER)); then
+    note "Skipping atmos-decode"
+else
+    if ((FROM_SOURCE)); then
+        build_decoder
+    elif ! download_decoder; then
+        command -v dotnet >/dev/null || die "Prebuilt atmos-decode unavailable. Install dotnet-sdk and rerun, or use --skip-decoder."
+        note "Falling back to building from source"
+        build_decoder
+    fi
     ln -sf "$DATA_DIR/decoder/atmos-decode" "$BIN_DIR/atmos-decode"
+    "$BIN_DIR/atmos-decode" --positions >/dev/null || die "atmos-decode does not run on this system"
 fi
 
 install -m 755 "$ROOT/bin/atmos-play" "$BIN_DIR/atmos-play"

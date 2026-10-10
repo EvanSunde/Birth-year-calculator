@@ -10,6 +10,9 @@
     <!-- Run on whatever newer .NET runtime the distro ships (Arch: dotnet-runtime) -->
     <RollForward>Major</RollForward>
     <ServerGarbageCollector>false</ServerGarbageCollector>
+    <!-- Native builds (dotnet publish -r linux-x64 -p:PublishAot=true, as in CI): one
+         self-contained executable that only needs libc -->
+    <StripSymbols>true</StripSymbols>
     <Description>Decodes Dolby Atmos (E-AC-3 + JOC, Dolby Atmos Master Format) with Cavern and streams speaker-rendered PCM to stdout.</Description>
   </PropertyGroup>
 

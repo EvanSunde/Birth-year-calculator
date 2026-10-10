@@ -1,0 +1,80 @@
+# Builds atmos-decode as native Linux executables (.NET NativeAOT: no .NET runtime needed)
+# and publishes them on the "atmos-decode-latest" release, where linux-atmos/install.sh
+# downloads them from.
+name: atmos-decode
+
+on:
+  push:
+    paths:
+      - linux-atmos/decoder/**
+      - .github/workflows/atmos-decode.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: atmos-decode-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Oldest supported runner: the binaries need glibc >= 2.35
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Install NativeAOT toolchain
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang zlib1g-dev
+
+      - name: Build
+        working-directory: linux-atmos/decoder
+        env:
+          DOTNET_NOLOGO: 1
+          DOTNET_CLI_TELEMETRY_OPTOUT: 1
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          # x86-64-v3 (AVX2, Haswell/Zen and newer) is ~20% faster; the baseline build is the fallback
+          for isa in x86-x64-v3 x86-x64-v1; do
+            rm -rf bin obj
+            dotnet publish -c Release -r linux-x64 -p:PublishAot=true -p:IlcInstructionSet=$isa -o "out-$isa"
+          done
+          cp out-x86-x64-v3/atmos-decode "$GITHUB_WORKSPACE/dist/atmos-decode-linux-x64-v3"
+          cp out-x86-x64-v1/atmos-decode "$GITHUB_WORKSPACE/dist/atmos-decode-linux-x64"
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          ffmpeg -version >/dev/null 2>&1 || sudo apt-get install -y -qq ffmpeg
+          cd dist
+          ffmpeg -v error -f lavfi -i "sine=f=440:d=1" -ac 6 -c:a eac3 -b:a 384k -f eac3 test.eac3
+          for bin in atmos-decode-linux-x64 atmos-decode-linux-x64-v3; do
+            chmod +x "$bin"
+            "./$bin" --info test.eac3
+            bytes=$("./$bin" test.eac3 | wc -c)
+            echo "$bin: $bytes bytes"
+            test "$bytes" -gt 1000000
+          done
+          rm test.eac3
+          sha256sum atmos-decode-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=atmos-decode-latest
+          notes="Native atmos-decode built from ${GITHUB_SHA} (${GITHUB_REF_NAME}).
+
+          Uses Cavern by VoidX (http://en.sbence.hu, https://github.com/VoidXH/Cavern), free for
+          non-commercial use under its licence: https://github.com/VoidXH/Cavern/blob/master/LICENSE.md"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --notes "$notes"
+          else
+            gh release create "$tag" --prerelease --target "$GITHUB_SHA" --title "atmos-decode (latest build)" --notes "$notes"
+          fi
+          gh release upload "$tag" dist/* --clobber

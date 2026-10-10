@@ -54,6 +54,8 @@ static class Program {
               --positions       Print the PipeWire channel map of --layout and exit
           -g, --gain <dB>       Output gain in dB (default 0)
           -h, --help            Show this help
+
+        Decoding by Cavern, (c) VoidX - http://en.sbence.hu - https://github.com/VoidXH/Cavern
         """;
 
     static int Main(string[] args) {
