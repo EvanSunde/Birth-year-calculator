@@ -328,6 +328,38 @@ impl<W: Write> Sink<W> {
     }
 }
 
+/// Reads up to the first major sync and returns the bytes from the access unit that carries it,
+/// with the number of whole access units before it (found by walking their length fields).
+/// If the input doesn't start on an access unit boundary, everything read is returned unchanged
+/// with a count of 0, and the extractor resynchronises on its own.
+fn skip_to_major_sync<R: Read>(input: &mut R) -> io::Result<(Vec<u8>, usize)> {
+    const SYNC: [u8; 4] = [0xF8, 0x72, 0x6F, 0xBA];
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1 << 14];
+    let sync = loop {
+        if let Some(p) = buf.windows(4).position(|w| w == SYNC) { break Some(p); }
+        if buf.len() > 4 << 20 { break None; }
+        let n = match input.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if n == 0 { break None; }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let Some(sync) = sync.filter(|&s| s >= 4) else { return Ok((buf, 0)) };
+    let au_start = sync - 4; // access unit header (length + input timing) precedes the sync
+    let (mut pos, mut count) = (0usize, 0usize);
+    while pos < au_start {
+        let length = ((((buf[pos] & 0x0F) as usize) << 8) | buf[pos + 1] as usize) * 2;
+        if length < 4 { return Ok((buf, 0)); }
+        pos += length;
+        count += 1;
+    }
+    if pos != au_start { return Ok((buf, 0)); }
+    Ok((buf.split_off(au_start), count))
+}
+
 fn run(gain: f32) -> io::Result<()> {
     let mut sink = Sink { r: Renderer::new(gain), w: io::BufWriter::with_capacity(1 << 16, io::stdout().lock()),
                           buf: Vec::with_capacity(1 << 14), held: Vec::new(), held_samples: 0,
@@ -338,6 +370,13 @@ fn run(gain: f32) -> io::Result<()> {
     let mut resyncing = false;
     let mut stdin = io::stdin().lock();
     let mut chunk = vec![0u8; 1 << 16];
+
+    // A stream cut mid-way (every seek) starts with access units that can't be decoded before the
+    // first major sync. The extractor skips them without reporting them, which would put the output
+    // earlier than the input's timestamps. Count them here instead: they become silence.
+    let (head, skipped) = skip_to_major_sync(&mut stdin)?;
+    sink.lost += skipped;
+    extractor.push_bytes(&head);
 
     loop {
         let n = match stdin.read(&mut chunk) {
